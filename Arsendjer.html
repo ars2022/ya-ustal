@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Arsendjer</title>
+  <style>
+    :root { --bg: #f0f2f5; --card: #fff; --primary: #0a7cff; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); height: 100dvh; display: flex; justify-content: center; align-items: center; }
+    .app { width: 100%; max-width: 500px; height: 100vh; background: var(--card); display: flex; flex-direction: column; overflow: hidden; }
+    .screen { display: none; flex-direction: column; height: 100%; padding: 16px; }
+    .screen.active { display: flex; }
+    input, button { font-size: 16px; padding: 12px; border-radius: 10px; border: 1px solid #d1d5db; width: 100%; margin-bottom: 8px; }
+    button { background: var(--primary); color: white; border: none; cursor: pointer; font-weight: bold; }
+    button.secondary { background: #e5e7eb; color: #1f2937; }
+    .msg { background: #e4e6eb; padding: 10px; border-radius: 12px; margin: 6px 0; max-width: 80%; word-break: break-word; }
+    .msg.me { background: #0084ff; color: white; align-self: flex-end; }
+    .chat-area { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; }
+    .attach-btns { display: flex; gap: 6px; }
+    .attach-btns button { flex: 1; padding: 10px; font-size: 14px; }
+    .hidden { display: none !important; }
+    .contacts-list { list-style: none; padding: 0; }
+    .contact { padding: 12px; background: #f9fafb; margin: 6px 0; border-radius: 10px; cursor: pointer; display: flex; justify-content: space-between; }
+    .contact:hover { background: #eef2ff; }
+    .recording { background: #ef4444 !important; color: white; }
+    .btn-group { display: flex; gap: 10px; }
+    .btn-group button { flex: 1; }
+    .name-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    .name-row span { font-weight: 600; }
+    .name-row button { width: auto; padding: 6px 12px; margin: 0; }
+    .error-msg { color: red; margin-top: 8px; font-weight: bold; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/paho-mqtt@1.1.0/paho-mqtt.min.js"></script>
+</head>
+<body>
+<div class="app" id="app">
+  <!-- Экран входа / регистрации -->
+  <div id="loginScreen" class="screen active">
+    <h2>🔐 Arsendjer</h2>
+    <input type="text" id="pubIdInput" placeholder="Публичный ID (уникальный код)">
+    <input type="password" id="secretInput" placeholder="Секретный ключ (для синхронизации)">
+    <input type="text" id="nameInput" placeholder="Твоё имя">
+    <div class="btn-group">
+      <button id="registerBtn" class="secondary">✍️ Зарегистрироваться</button>
+      <button id="loginBtn">🔑 Войти</button>
+    </div>
+    <div id="loginMsg" class="error-msg"></div>
+    <button id="cancelConnectBtn" class="secondary hidden" style="background:#eee;">Отмена</button>
+  </div>
+
+  <!-- Главный экран -->
+  <div id="mainScreen" class="screen">
+    <div class="name-row">
+      <span>👤 <span id="currentNameDisplay"></span></span>
+      <button id="changeNameBtn" class="secondary" style="font-size:14px;">✏️</button>
+    </div>
+    <div style="display:flex; gap:6px;">
+      <input type="text" id="addContactInput" placeholder="Введи ID собеседника">
+      <button id="addContactBtn" style="width:auto;">➕ Добавить</button>
+    </div>
+    <h3>📇 Мои контакты</h3>
+    <ul id="contactsList" class="contacts-list"></ul>
+    <button id="logoutBtn" class="secondary" style="margin-top:auto;">🚪 Выйти</button>
+  </div>
+
+  <!-- Экран чата -->
+  <div id="chatScreen" class="screen">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <button id="backBtn" class="secondary" style="width:auto; padding:10px;">←</button>
+      <strong id="chatTitle"></strong>
+    </div>
+    <div id="chatMessages" class="chat-area"></div>
+    <div class="attach-btns">
+      <button id="attachPhotoBtn">📷 Фото</button>
+      <button id="attachVideoBtn">🎬 Видео</button>
+      <button id="recordVoiceBtn" class="secondary">🎤 Голос</button>
+    </div>
+    <div style="display:flex; gap:6px;">
+      <input type="text" id="messageInput" placeholder="Сообщение...">
+      <button id="sendBtn" style="width:auto;">→</button>
+    </div>
+    <div id="recordingStatus" style="text-align:center;color:red;font-weight:bold;margin:5px;"></div>
+  </div>
+</div>
+
+<script>
+  window.addEventListener('DOMContentLoaded', () => {
+    if (typeof Paho === 'undefined') {
+      document.getElementById('loginMsg').innerText = 'Ошибка загрузки библиотеки';
+      return;
+    }
+
+    let myPublicId = '';
+    let mySecret = '';
+    let myName = '';
+    let currentChatId = null;
+    let client = null;
+    let connectTimer = null;
+    let connectionCanceled = false;
+
+    // Список брокеров с портами, которые обычно не блокируются (443, 8084, 8884)
+    const BROKERS = [
+      { url: 'wss://mqtt.eclipseprojects.io/mqtt', name: 'Eclipse (443)' },
+      { url: 'wss://broker.hivemq.com:8884/mqtt', name: 'HiveMQ (8884)' },
+      { url: 'wss://broker.emqx.io:8084/mqtt', name: 'EMQX (8084)' },
+      { url: 'wss://test.mosquitto.org:8081/mqtt', name: 'Mosquitto (8081)' },
+      { url: 'wss://mqtt.flespi.io/mqtt', name: 'Flespi (443)' }
+    ];
+
+    // ==================== MQTT ====================
+    function connectToBroker(index = 0) {
+      if (connectionCanceled) return;
+      if (index >= BROKERS.length) {
+        document.getElementById('loginMsg').innerText = 'Все серверы недоступны. Проверьте интернет.';
+        resetButtons();
+        return;
+      }
+
+      const broker = BROKERS[index];
+      if (client) client.disconnect();
+      client = new Paho.MQTT.Client(broker.url, myPublicId + '_' + Math.random().toString(36).substr(2,8));
+      client.onConnectionLost = () => {
+        if (!connectionCanceled) setTimeout(() => connectToBroker(0), 3000);
+      };
+      client.onMessageArrived = onMessage;
+
+      document.getElementById('loginMsg').innerText = `Пробуем сервер ${index+1}/${BROKERS.length}: ${broker.name}…`;
+      client.connect({
+        onSuccess: () => {
+          clearTimeout(connectTimer);
+          client.subscribe('arsendjer/chat/' + myPublicId);
+          client.subscribe('arsendjer/profile/' + myPublicId);
+          resetButtons();
+          showMain();
+        },
+        onFailure: (err) => {
+          clearTimeout(connectTimer);
+          console.warn(broker.name + ' ошибка: ' + err.errorMessage);
+          connectToBroker(index + 1);
+        },
+        timeout: 3,
+        keepAliveInterval: 30
+      });
+
+      connectTimer = setTimeout(() => {
+        if (client && !client.isConnected()) {
+          client.disconnect();
+          connectToBroker(index + 1);
+        }
+      }, 4000);
+    }
+
+    function onMessage(message) {
+      const topic = message.destinationName;
+      const payload = message.payloadString;
+      try {
+        if (topic === 'arsendjer/profile/' + myPublicId) {
+          handleProfileMessage(payload);
+        } else if (topic.startsWith('arsendjer/chat/')) {
+          const data = JSON.parse(payload);
+          if (data.from === myPublicId) return;
+          saveMessage(data.from, data);
+          if (currentChatId === data.from) renderChat(data.from);
+        }
+      } catch(e) {}
+    }
+
+    // ==================== ПРОФИЛЬ (MQTT retained) ====================
+    async function publishProfile() {
+      const profile = { contacts: getContacts(), chats: {} };
+      for (const cid of getContacts()) {
+        profile.chats[cid] = getHistory(cid);
+      }
+      const encrypted = await encryptData(JSON.stringify(profile), mySecret);
+      const msg = new Paho.MQTT.Message(encrypted);
+      msg.destinationName = 'arsendjer/profile/' + myPublicId;
+      msg.retained = true;
+      if (client && client.isConnected()) client.send(msg);
+    }
+
+    async function handleProfileMessage(encryptedText) {
+      if (!encryptedText) return;
+      try {
+        const decrypted = await decryptData(encryptedText, mySecret);
+        const profile = JSON.parse(decrypted);
+        if (profile.contacts) setContacts(profile.contacts);
+        if (profile.chats) {
+          for (const [cid, msgs] of Object.entries(profile.chats)) {
+            setHistory(cid, msgs);
+          }
+        }
+        updateContactList();
+        if (currentChatId) renderChat(currentChatId);
+      } catch(e) {}
+    }
+
+    // ==================== ХРАНИЛИЩЕ ====================
+    function getHistory(contactId) {
+      return JSON.parse(localStorage.getItem(`chat_${myPublicId}_${contactId}`) || '[]');
+    }
+    function setHistory(contactId, messages) {
+      localStorage.setItem(`chat_${myPublicId}_${contactId}`, JSON.stringify(messages.slice(-200)));
+    }
+    function saveMessage(contactId, msg) {
+      msg.time = Date.now();
+      const hist = getHistory(contactId);
+      hist.push(msg);
+      setHistory(contactId, hist);
+      if (currentChatId === contactId) renderChat(contactId);
+      publishProfile(); // автосохранение
+    }
+    function getContacts() {
+      return JSON.parse(localStorage.getItem(`contacts_${myPublicId}`) || '[]');
+    }
+    function setContacts(contacts) {
+      localStorage.setItem(`contacts_${myPublicId}`, JSON.stringify(contacts));
+    }
+
+    // ==================== ШИФРОВАНИЕ ====================
+    async function encryptData(text, password) {
+      const enc = new TextEncoder();
+      const pwHash = await crypto.subtle.digest('SHA-256', enc.encode(password));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const key = await crypto.subtle.importKey('raw', pwHash, { name: 'AES-GCM' }, false, ['encrypt']);
+      const encoded = enc.encode(text);
+      const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+      const combined = new Uint8Array(iv.byteLength + encrypted.byteLength);
+      combined.set(iv, 0);
+      combined.set(new Uint8Array(encrypted), iv.byteLength);
+      return btoa(String.fromCharCode(...combined));
+    }
+    async function decryptData(encryptedBase64, password) {
+      const enc = new TextEncoder();
+      const pwHash = await crypto.subtle.digest('SHA-256', enc.encode(password));
+      const key = await crypto.subtle.importKey('raw', pwHash, { name: 'AES-GCM' }, false, ['decrypt']);
+      const combined = Uint8Array.from(atob(encryptedBase64), c => c.charCodeAt(0));
+      const iv = combined.slice(0, 12);
+      const data = combined.slice(12);
+      const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+      return new TextDecoder().decode(decrypted);
+    }
+
+    // ==================== ЭКРАНЫ ====================
+    const loginScreen = document.getElementById('loginScreen');
+    const mainScreen = document.getElementById('mainScreen');
+    const chatScreen = document.getElementById('chatScreen');
+
+    function showMain() {
+      loginScreen.classList.remove('active');
+      mainScreen.classList.add('active');
+      chatScreen.classList.remove('active');
+      document.getElementById('currentNameDisplay').innerText = myName;
+      updateContactList();
+    }
+    function showChat(contactId) {
+      loginScreen.classList.remove('active');
+      mainScreen.classList.remove('active');
+      chatScreen.classList.add('active');
+      currentChatId = contactId;
+      document.getElementById('chatTitle').innerText = contactId;
+      renderChat(contactId);
+    }
+    function updateContactList() {
+      const list = document.getElementById('contactsList');
+      const contacts = getContacts();
+      list.innerHTML = '';
+      contacts.forEach(id => {
+        const li = document.createElement('li');
+        li.className = 'contact';
+        li.innerHTML = `<span>${id}</span>`;
+        li.onclick = () => showChat(id);
+        list.appendChild(li);
+      });
+    }
+    function resetButtons() {
+      document.getElementById('registerBtn').disabled = false;
+      document.getElementById('loginBtn').disabled = false;
+      document.getElementById('registerBtn').textContent = '✍️ Зарегистрироваться';
+      document.getElementById('loginBtn').textContent = '🔑 Войти';
+      document.getElementById('cancelConnectBtn').classList.add('hidden');
+    }
+
+    // ==================== РЕНДЕР ЧАТА ====================
+    function renderChat(contactId) {
+      const container = document.getElementById('chatMessages');
+      const hist = getHistory(contactId);
+      container.innerHTML = '';
+      hist.forEach(msg => {
+        const div = document.createElement('div');
+        div.className = 'msg ' + (msg.from === myPublicId ? 'me' : '');
+        let content = msg.text || '';
+        div.innerHTML = `<div style="font-weight:600;font-size:0.85em;">${msg.name || msg.from}</div>${content}<div style="font-size:0.7em;color:gray;text-align:right;">${new Date(msg.time).toLocaleTimeString()}</div>`;
+        container.appendChild(div);
+      });
+      container.scrollTop = container.scrollHeight;
+    }
+
+    // ==================== АУТЕНТИФИКАЦИЯ ====================
+    function authenticate(isRegistration) {
+      const pub = document.getElementById('pubIdInput').value.trim();
+      const sec = document.getElementById('secretInput').value.trim();
+      const name = document.getElementById('nameInput').value.trim();
+      const msgEl = document.getElementById('loginMsg');
+
+      if (!pub || !name) { msgEl.innerText = 'Введи ID и имя'; return; }
+      if (pub.includes(' ')) { msgEl.innerText = 'ID не должен содержать пробелов'; return; }
+      if (!sec) { msgEl.innerText = 'Введи секретный ключ'; return; }
+
+      myPublicId = pub;
+      mySecret = sec;
+      myName = name;
+      connectionCanceled = false;
+
+      document.getElementById('registerBtn').disabled = true;
+      document.getElementById('loginBtn').disabled = true;
+      document.getElementById('registerBtn').textContent = 'Подключение…';
+      document.getElementById('loginBtn').textContent = 'Подключение…';
+      document.getElementById('cancelConnectBtn').classList.remove('hidden');
+
+      if (isRegistration) {
+        localStorage.clear();
+        setContacts([]);
+      }
+
+      connectToBroker(0);
+    }
+
+    document.getElementById('registerBtn').addEventListener('click', () => authenticate(true));
+    document.getElementById('loginBtn').addEventListener('click', () => authenticate(false));
+
+    document.getElementById('cancelConnectBtn').addEventListener('click', () => {
+      connectionCanceled = true;
+      if (client) client.disconnect();
+      clearTimeout(connectTimer);
+      document.getElementById('loginMsg').innerText = 'Подключение отменено';
+      resetButtons();
+    });
+
+    // ==================== ОСТАЛЬНЫЕ КНОПКИ ====================
+    document.getElementById('addContactBtn').addEventListener('click', () => {
+      const id = document.getElementById('addContactInput').value.trim();
+      if (!id || id === myPublicId) return;
+      const contacts = getContacts();
+      if (!contacts.includes(id)) {
+        contacts.push(id);
+        setContacts(contacts);
+        updateContactList();
+        publishProfile();
+      }
+      document.getElementById('addContactInput').value = '';
+      showChat(id);
+    });
+
+    document.getElementById('backBtn').addEventListener('click', () => {
+      currentChatId = null;
+      chatScreen.classList.remove('active');
+      mainScreen.classList.add('active');
+    });
+
+    document.getElementById('sendBtn').addEventListener('click', () => {
+      const text = document.getElementById('messageInput').value.trim();
+      if (!text || !currentChatId) return;
+      const msg = { from: myPublicId, name: myName, type: 'text', text };
+      // Отправка напрямую в MQTT (чат контакта)
+      const topic = 'arsendjer/chat/' + currentChatId;
+      const mqttMsg = new Paho.MQTT.Message(JSON.stringify(msg));
+      mqttMsg.destinationName = topic;
+      if (client && client.isConnected()) client.send(mqttMsg);
+      saveMessage(currentChatId, msg);
+      document.getElementById('messageInput').value = '';
+    });
+
+    document.getElementById('logoutBtn').addEventListener('click', () => {
+      if (client) client.disconnect();
+      myPublicId = ''; mySecret = ''; myName = '';
+      currentChatId = null;
+      loginScreen.classList.add('active');
+      mainScreen.classList.remove('active');
+      chatScreen.classList.remove('active');
+    });
+
+    document.getElementById('changeNameBtn').addEventListener('click', () => {
+      const newName = prompt('Новое имя:', myName);
+      if (newName && newName.trim() !== '') {
+        myName = newName.trim();
+        localStorage.setItem('ars_name', myName);
+        document.getElementById('currentNameDisplay').innerText = myName;
+        publishProfile();
+      }
+    });
+
+    // Автозаполнение
+    const savedPub = localStorage.getItem('ars_pub');
+    const savedName = localStorage.getItem('ars_name');
+    if (savedPub) {
+      document.getElementById('pubIdInput').value = savedPub;
+      document.getElementById('nameInput').value = savedName || '';
+    }
+  });
+</script>
+</body>
+</html>
